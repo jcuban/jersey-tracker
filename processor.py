@@ -132,17 +132,52 @@ class VideoProcessor:
             sampled_frames = max(1, (end_frame - start_frame) // self.frame_sample_rate)
             _log_path = Path(__file__).parent / "debug_run.log"
 
+            # ---- Smart frame skipping constants ----
+            # Frames are skipped when the scene hasn't changed (timeouts, dead balls, huddles).
+            # Motion score = mean absolute pixel difference between consecutive sampled frames.
+            # Tuned for 1080p basketball: <4.0 = dead ball, >4.0 = active play.
+            MOTION_THRESHOLD = 4.0          # below this → skip (dead ball / timeout)
+            FORCE_EVERY_N = 90              # always process at least 1 frame every N sampled frames
+                                            # (catches slow-moving plays that look static)
+
             def _reader_thread():
-                """Reads + decodes frames on CPU, pushes to queue."""
+                """Reads + decodes frames on CPU.
+                Applies smart motion-based skipping before pushing to GPU queue.
+                Skips frames where the scene hasn't changed significantly.
+                """
                 idx = start_frame
+                prev_gray = None
+                frames_since_forced = 0
+
                 while idx < end_frame:
                     grabbed = cap.grab()
                     if not grabbed:
                         break
+
                     if (idx - start_frame) % self.frame_sample_rate == 0:
                         ret, frame = cap.retrieve()
                         if ret:
-                            frame_queue.put((idx, frame))
+                            # Compute motion score vs previous sampled frame
+                            small = cv2.resize(frame, (160, 90))
+                            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY).astype(float)
+
+                            if prev_gray is None:
+                                motion = 999.0  # always process first frame
+                            else:
+                                motion = float(cv2.absdiff(
+                                    gray.astype("uint8"),
+                                    prev_gray.astype("uint8")
+                                ).mean())
+
+                            frames_since_forced += 1
+                            force = frames_since_forced >= FORCE_EVERY_N
+
+                            if motion >= MOTION_THRESHOLD or force:
+                                frame_queue.put((idx, frame, motion))
+                                prev_gray = gray
+                                if force:
+                                    frames_since_forced = 0
+                            # else: dead ball — silently skip
                     idx += 1
                 frame_queue.put(_SENTINEL)
 
@@ -158,7 +193,7 @@ class VideoProcessor:
                 item = frame_queue.get()
                 if item is _SENTINEL:
                     break
-                frame_idx, frame = item
+                frame_idx, frame, motion_score = item
 
                 # --- Ball + rim detection (lightweight) ---
                 detection = self.detector.detect(frame)
