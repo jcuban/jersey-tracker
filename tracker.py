@@ -104,33 +104,62 @@ class PlayerTracker:
             except Exception:
                 kpts_xy = None
 
+        # --- First pass: collect all crops and metadata ---
+        player_data = []
+        batch_crops = []
+        batch_player_indices = []
+
         for i in range(len(boxes)):
             track_id = str(int(boxes.id[i].item()))
             x1, y1, x2, y2 = [v.item() for v in boxes.xyxy[i]]
             nx1, ny1, nx2, ny2 = x1 / w, y1 / h, x2 / w, y2 / h
             cx, cy = (nx1 + nx2) / 2, (ny1 + ny2) / 2
 
-            # --- Jersey crop from pose keypoints ---
             crop = self._pose_jersey_crop(frame, kpts_xy, i, x1, y1, x2, y2, h, w)
 
-            # --- Jersey number detection ---
+            px1, py1 = max(0, int(x1)), max(0, int(y1))
+            px2, py2 = min(w, int(x2)), min(h, int(y2))
+            full_crop = frame[py1:py2, px1:px2].copy() if px2 > px1 and py2 > py1 else None
+
             jersey_num = self.jersey_map.get(track_id, "?")
-            attempts = self._jersey_attempts[track_id]
-            if jersey_num == "?" and crop is not None and attempts < self._JERSEY_MAX_ATTEMPTS:
+            needs_ocr = (
+                jersey_num == "?" and
+                crop is not None and
+                self._jersey_attempts[track_id] < self._JERSEY_MAX_ATTEMPTS
+            )
+            if needs_ocr:
                 self._jersey_attempts[track_id] += 1
-                detected_num, conf = jersey_model.detect_number(crop)
+                batch_crops.append(crop)
+                batch_player_indices.append(len(player_data))
+
+            player_data.append({
+                "track_id": track_id,
+                "jersey_num": jersey_num,
+                "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                "nx1": nx1, "ny1": ny1, "nx2": nx2, "ny2": ny2,
+                "cx": cx, "cy": cy,
+                "crop": crop,
+                "full_crop": full_crop,
+            })
+
+        # --- Batch OCR: one GPU pass for all unlocked players ---
+        if batch_crops:
+            batch_results = jersey_model.detect_number_batch(batch_crops)
+            for bi, pi in enumerate(batch_player_indices):
+                detected_num, conf = batch_results[bi]
+                track_id = player_data[pi]["track_id"]
                 if detected_num != "?":
                     self._jersey_votes[track_id][detected_num] += 1
                     self._jersey_conf[track_id] = max(self._jersey_conf[track_id], conf)
                     votes = self._jersey_votes[track_id][detected_num]
                     if votes >= self.JERSEY_LOCK_VOTES and conf >= self.JERSEY_LOCK_CONFIDENCE:
                         self.jersey_map[track_id] = detected_num
-                        jersey_num = detected_num
+                        player_data[pi]["jersey_num"] = detected_num
 
-            # --- Colour sampling (full player crop for team separation) ---
-            px1, py1 = max(0, int(x1)), max(0, int(y1))
-            px2, py2 = min(w, int(x2)), min(h, int(y2))
-            full_crop = frame[py1:py2, px1:px2].copy() if px2 > px1 and py2 > py1 else None
+        # --- Second pass: build tracked list and colour samples ---
+        for pd in player_data:
+            track_id = pd["track_id"]
+            full_crop = pd["full_crop"]
 
             if full_crop is not None and len(self._colour_samples[track_id]) < 60:
                 colour = self._dominant_colour(full_crop)
@@ -139,10 +168,10 @@ class PlayerTracker:
 
             tracked.append({
                 "track_id": track_id,
-                "jersey_num": jersey_num,
+                "jersey_num": self.jersey_map.get(track_id, pd["jersey_num"]),
                 "team": self.team_map.get(track_id, "unknown"),
-                "bbox": (nx1, ny1, nx2, ny2),
-                "center": (cx, cy),
+                "bbox": (pd["nx1"], pd["ny1"], pd["nx2"], pd["ny2"]),
+                "center": (pd["cx"], pd["cy"]),
                 "crop": full_crop,
             })
 
