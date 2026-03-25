@@ -238,12 +238,13 @@ class PlayerTracker:
         torso = crop[int(h * 0.2):int(h * 0.7), int(w * 0.2):int(w * 0.8)]
         if torso.size == 0:
             return None
-        # Convert to L*a*b* and cluster on a*/b* only (lighting-invariant)
-        lab = cv2.cvtColor(torso, cv2.COLOR_BGR2LAB)
-        ab = lab[:, :, 1:].reshape(-1, 2).astype(np.float32)
-        if len(ab) < 10:
+        # Convert to L*a*b* — store all 3 channels (L*, a*, b*)
+        # L* = brightness (0=black, 255=white), a*/b* = colour axes
+        lab = cv2.cvtColor(torso, cv2.COLOR_BGR2LAB).astype(np.float32)
+        pixels = lab.reshape(-1, 3)
+        if len(pixels) < 10:
             return None
-        return np.mean(ab, axis=0)  # (a*, b*)
+        return np.mean(pixels, axis=0)  # (L*, a*, b*)
 
     def _maybe_cluster_teams(self):
         eligible = {
@@ -256,19 +257,20 @@ class PlayerTracker:
 
         tids = list(eligible.keys())
         rep_colours = np.array([np.mean(eligible[t], axis=0) for t in tids])
+        # rep_colours columns: [L*, a*, b*]
 
-        # Filter out refs/coaches (near-black or near-white in a*b* space)
-        # In L*a*b* a*/b* space both are near (128,128) — we use L* brightness
-        # We stored a*b* only, so filter by distance from neutral (128,128)
-        neutrality = np.linalg.norm(rep_colours - 128.0, axis=1)
-        # Keep players with some colour character; refs in black ≈ (128,128)
-        valid_mask = neutrality > 2.0
+        # Filter out refs/coaches using L* brightness:
+        # Refs wear black (L*≈30) or white (L*≈220) — both extreme values
+        # Players are in between. Filter out L* < 40 (black refs) only.
+        l_star = rep_colours[:, 0]
+        valid_mask = l_star > 40.0  # exclude near-black (refs/officials)
         if valid_mask.sum() < 4:
             valid_mask = np.ones(len(tids), dtype=bool)
 
         v_tids = [t for t, v in zip(tids, valid_mask) if v]
         v_colours = rep_colours[valid_mask]
 
+        # Cluster on all 3 channels (L*, a*, b*) for better separation
         # Top 20 most-observed tracks
         sample_counts = np.array([len(eligible[t]) for t in v_tids])
         if len(v_tids) > 20:
@@ -283,11 +285,9 @@ class PlayerTracker:
         labels = km.fit_predict(v_colours)
         self._team_centers = km.cluster_centers_
 
-        # "light" = higher L* brightness; since we only have a*b*, use cluster
-        # membership size as tiebreak — but brightness correlates with a*b* distance
-        # from neutral. Lighter jerseys (white) are near (128,128); darker are further.
-        neutrality_centers = np.linalg.norm(km.cluster_centers_ - 128.0, axis=1)
-        light_label = int(np.argmin(neutrality_centers))  # closer to neutral = lighter
+        # "light" = higher mean L* brightness — this is always correct
+        # White jerseys have L*≈200+, dark jerseys have L*≈80-120
+        light_label = int(np.argmax(km.cluster_centers_[:, 0]))
 
         for tid, label in zip(v_tids, labels):
             self.team_map[tid] = "light" if label == light_label else "dark"
