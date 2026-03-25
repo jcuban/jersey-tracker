@@ -13,6 +13,8 @@ Two-stage approach:
 import os
 import re
 import cv2
+
+_DIGIT_RE = re.compile(r"\D")  # compiled once at module level
 import numpy as np
 from pathlib import Path
 from typing import Optional, Tuple
@@ -91,12 +93,8 @@ class JerseyModel:
             _model = torch.hub.load(
                 "baudm/parseq", "parseq", pretrained=True, verbose=False
             ).eval().cuda().half()  # FP16: ~1.5x faster on RTX 2080 Ti
-            try:
-                self._ocr = torch.compile(_model, mode="reduce-overhead")
-                print("[jersey_model] PARSeq ready (GPU, FP16, torch.compile)")
-            except Exception as ce:
-                self._ocr = _model
-                print(f"[jersey_model] PARSeq ready (GPU, FP16) — compile skipped: {ce}")
+            self._ocr = _model
+            print("[jersey_model] PARSeq ready (GPU, FP16)")
             self._ocr_transform = transforms.Compose([
                 transforms.Resize((32, 128)),
                 transforms.ToTensor(),
@@ -168,15 +166,33 @@ class JerseyModel:
 
         try:
             with torch.no_grad():
-                for tensors in [tensors_normal, tensors_inverted]:
-                    batch = torch.stack(tensors).cuda().half()
-                    logits = self._ocr(batch)
-                    probs = logits.softmax(-1)
-                    preds, confs = self._ocr.tokenizer.decode(probs)
-                    for j, idx in enumerate(valid_indices):
-                        text = preds[j] if j < len(preds) else ""
-                        conf = float(confs[j].mean()) if j < len(confs) else 0.0
-                        digits = re.sub(r"\D", "", text)
+                # Pass 1: normal images
+                batch = torch.stack(tensors_normal).cuda().half()
+                logits = self._ocr(batch)
+                probs = logits.softmax(-1)
+                preds, confs = self._ocr.tokenizer.decode(probs)
+                needs_invert = []
+                for j, idx in enumerate(valid_indices):
+                    text = preds[j] if j < len(preds) else ""
+                    conf = float(confs[j].mean()) if j < len(confs) else 0.0
+                    digits = _DIGIT_RE.sub("", text)
+                    if digits and 1 <= len(digits) <= 2 and conf >= 0.3:
+                        results[idx] = (digits, conf)
+                    else:
+                        needs_invert.append(j)  # low confidence — try inverted
+
+                # Pass 2: inverted only for low-confidence results
+                if needs_invert:
+                    inv_tensors = [tensors_inverted[j] for j in needs_invert]
+                    inv_indices = [valid_indices[j] for j in needs_invert]
+                    batch_inv = torch.stack(inv_tensors).cuda().half()
+                    logits_inv = self._ocr(batch_inv)
+                    probs_inv = logits_inv.softmax(-1)
+                    preds_inv, confs_inv = self._ocr.tokenizer.decode(probs_inv)
+                    for k, idx in enumerate(inv_indices):
+                        text = preds_inv[k] if k < len(preds_inv) else ""
+                        conf = float(confs_inv[k].mean()) if k < len(confs_inv) else 0.0
+                        digits = _DIGIT_RE.sub("", text)
                         if digits and 1 <= len(digits) <= 2 and conf >= 0.3:
                             cur_text, cur_conf = results[idx]
                             if conf > cur_conf:
