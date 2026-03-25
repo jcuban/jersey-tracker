@@ -125,6 +125,69 @@ class JerseyModel:
     # Public API
     # ------------------------------------------------------------------
 
+    def detect_number_batch(self, crops: list) -> list:
+        """
+        Batch version of detect_number — processes all crops in ONE GPU forward pass.
+        Returns list of ("number_str", confidence) tuples.
+        Much faster than calling detect_number() in a loop when using PARSeq.
+        """
+        self._load_ocr()
+        if not crops:
+            return []
+
+        if self._ocr_engine != "parseq" or self._ocr is None:
+            # Fallback: call single detect for non-PARSeq engines
+            return [self.detect_number(c) for c in crops]
+
+        import torch
+        from PIL import Image
+
+        results = [("?", 0.0)] * len(crops)
+        tensors_normal = []
+        tensors_inverted = []
+        valid_indices = []
+
+        for i, crop in enumerate(crops):
+            if crop is None or crop.size == 0:
+                continue
+            try:
+                resized = cv2.resize(crop, (128, 256))
+                h, w = resized.shape[:2]
+                scale = max(2, 64 // max(h, 1))
+                enlarged = cv2.resize(resized, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC)
+                pil_n = Image.fromarray(cv2.cvtColor(enlarged, cv2.COLOR_BGR2RGB))
+                pil_i = Image.fromarray(cv2.cvtColor(cv2.bitwise_not(enlarged), cv2.COLOR_BGR2RGB))
+                tensors_normal.append(self._ocr_transform(pil_n))
+                tensors_inverted.append(self._ocr_transform(pil_i))
+                valid_indices.append(i)
+            except Exception:
+                continue
+
+        if not valid_indices:
+            return results
+
+        try:
+            with torch.no_grad():
+                for tensors in [tensors_normal, tensors_inverted]:
+                    batch = torch.stack(tensors).cuda().half()
+                    logits = self._ocr(batch)
+                    probs = logits.softmax(-1)
+                    preds, confs = self._ocr.tokenizer.decode(probs)
+                    for j, idx in enumerate(valid_indices):
+                        text = preds[j] if j < len(preds) else ""
+                        conf = float(confs[j].mean()) if j < len(confs) else 0.0
+                        digits = re.sub(r"\D", "", text)
+                        if digits and 1 <= len(digits) <= 2 and conf >= 0.3:
+                            cur_text, cur_conf = results[idx]
+                            if conf > cur_conf:
+                                results[idx] = (digits, conf)
+        except Exception as e:
+            # Fallback to single if batch fails
+            for i, idx in enumerate(valid_indices):
+                results[idx] = self.detect_number(crops[idx])
+
+        return results
+
     def detect_number(self, crop: np.ndarray) -> Tuple[str, float]:
         """
         Read jersey number from a pre-cropped region (shoulder→hip keypoint crop
