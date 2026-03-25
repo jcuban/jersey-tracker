@@ -45,7 +45,7 @@ class DetectionResult:
 class Detector:
     RIM_DETECT_INTERVAL = 30
 
-    def __init__(self, model_path: str = "yolov8n.pt", conf: float = 0.3):
+    def __init__(self, model_path: str = "yolov8n.pt", conf: float = 0.15):
         self.conf = conf
         self.model_path = model_path
         self._model = None

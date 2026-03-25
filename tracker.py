@@ -31,7 +31,7 @@ class PlayerTracker:
 
     JERSEY_LOCK_CONFIDENCE = 0.45
     JERSEY_LOCK_VOTES      = 5
-    COLOR_SAMPLES_NEEDED   = 15
+    COLOR_SAMPLES_NEEDED   = 4
 
     def __init__(self, base_model_path: str = "yolov8n-pose.engine"):
         self._model = None
@@ -43,6 +43,10 @@ class PlayerTracker:
         self._jersey_conf: Dict[str, float] = defaultdict(float)
         self._jersey_attempts: Dict[str, int] = defaultdict(int)
         self._JERSEY_MAX_ATTEMPTS = 150
+
+        # KMeans caching — only refit when enough new samples arrive
+        self._last_cluster_sample_count = 0
+        self._CLUSTER_REFIT_THRESHOLD = 30  # refit every 30 new samples
 
         # track_id → colour samples (RGB)
         self._colour_samples: Dict[str, List[np.ndarray]] = defaultdict(list)
@@ -81,8 +85,8 @@ class PlayerTracker:
             tracker="bytetrack.yaml",
             persist=True,
             verbose=False,
-            conf=0.3,
-            iou=0.5,
+            conf=0.25,
+            iou=0.45,
             half=True,                # FP16 — safe for person/pose
             device=0,
         )
@@ -254,6 +258,12 @@ class PlayerTracker:
         }
         if len(eligible) < 4:
             return
+
+        # Only refit KMeans when enough new samples have arrived
+        total_samples = sum(len(s) for s in eligible.values())
+        if total_samples - self._last_cluster_sample_count < self._CLUSTER_REFIT_THRESHOLD:
+            return
+        self._last_cluster_sample_count = total_samples
 
         tids = list(eligible.keys())
         rep_colours = np.array([np.mean(eligible[t], axis=0) for t in tids])
