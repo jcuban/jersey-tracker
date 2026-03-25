@@ -11,6 +11,8 @@ processor.py — End-to-end video processing pipeline.
 
 import asyncio
 import os
+import queue
+import threading
 import traceback
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -121,82 +123,99 @@ class VideoProcessor:
             cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 4)
 
-            # ---- Main frame loop — grab()/retrieve() skips decode for dropped frames ----
-            frame_idx = start_frame
-            processed = 0
+            # ---- Producer-consumer: CPU decodes frames, GPU runs inference ----
+            # CPU thread fills frame_queue; main thread drains it on GPU.
+            QUEUE_SIZE = 8  # buffer up to 8 decoded frames
+            frame_queue: queue.Queue = queue.Queue(maxsize=QUEUE_SIZE)
+            _SENTINEL = object()
+
             sampled_frames = max(1, (end_frame - start_frame) // self.frame_sample_rate)
+            _log_path = Path(__file__).parent / "debug_run.log"
+
+            def _reader_thread():
+                """Reads + decodes frames on CPU, pushes to queue."""
+                idx = start_frame
+                while idx < end_frame:
+                    grabbed = cap.grab()
+                    if not grabbed:
+                        break
+                    if (idx - start_frame) % self.frame_sample_rate == 0:
+                        ret, frame = cap.retrieve()
+                        if ret:
+                            frame_queue.put((idx, frame))
+                    idx += 1
+                frame_queue.put(_SENTINEL)
+
+            reader = threading.Thread(target=_reader_thread, daemon=True)
+            reader.start()
+
+            processed = 0
             last_ws_update = 0
             _jersey_hits = 0
             _jersey_misses = 0
-            _log_path = Path(__file__).parent / "debug_run.log"
 
-            while frame_idx < end_frame:
-                grabbed = cap.grab()
-                if not grabbed:
+            while True:
+                item = frame_queue.get()
+                if item is _SENTINEL:
                     break
+                frame_idx, frame = item
 
-                if (frame_idx - start_frame) % self.frame_sample_rate == 0:
-                    ret, frame = cap.retrieve()
-                    if not ret:
-                        frame_idx += 1
-                        continue
+                # --- Ball + rim detection (lightweight) ---
+                detection = self.detector.detect(frame)
 
-                    # --- Ball + rim detection (lightweight) ---
-                    detection = self.detector.detect(frame)
+                # --- Tracking: single YOLO-pose call (persons + keypoints + ByteTrack) ---
+                tracked_players = tracker.track_frame(frame, detection, self.jersey_model)
 
-                    # --- Tracking: single YOLO-pose call (persons + keypoints + ByteTrack) ---
-                    tracked_players = tracker.track_frame(frame, detection, self.jersey_model)
+                # --- Jersey detection logging (first 500 sampled frames) ---
+                if processed < 500:
+                    for p in tracked_players:
+                        if p["jersey_num"] != "?":
+                            _jersey_hits += 1
+                        else:
+                            _jersey_misses += 1
+                if processed == 500:
+                    with open(_log_path, "w") as f:
+                        f.write(f"Jersey hits: {_jersey_hits}\n")
+                        f.write(f"Jersey misses: {_jersey_misses}\n")
+                        f.write(f"Jersey map: {tracker.jersey_map}\n")
+                        f.write(f"Team map sample: {dict(list(tracker.team_map.items())[:10])}\n")
 
-                    # --- Jersey detection logging (first 500 sampled frames) ---
-                    if processed < 500:
-                        for p in tracked_players:
-                            if p["jersey_num"] != "?":
-                                _jersey_hits += 1
-                            else:
-                                _jersey_misses += 1
-                    if processed == 500:
-                        with open(_log_path, "w") as f:
-                            f.write(f"Jersey hits: {_jersey_hits}\n")
-                            f.write(f"Jersey misses: {_jersey_misses}\n")
-                            f.write(f"Jersey map: {tracker.jersey_map}\n")
-                            f.write(f"Team map sample: {dict(list(tracker.team_map.items())[:10])}\n")
+                # --- Stats engine ---
+                stats_engine.update(
+                    frame_idx=frame_idx,
+                    tracked_players=tracked_players,
+                    ball_pos=detection.ball,
+                    rim_pos=detection.rim,
+                    fps=fps,
+                )
 
-                    # --- Stats engine ---
-                    stats_engine.update(
-                        frame_idx=frame_idx,
-                        tracked_players=tracked_players,
-                        ball_pos=detection.ball,
-                        rim_pos=detection.rim,
-                        fps=fps,
-                    )
+                processed += 1
+                pct = min(99, 5 + int(94 * processed / max(1, sampled_frames)))
 
-                    processed += 1
-                    pct = min(99, 5 + int(94 * processed / max(1, sampled_frames)))
+                new_events = stats_engine.get_events()
+                if processed - last_ws_update >= 30 or len(new_events) > 0:
+                    last_ws_update = processed
+                    snapshot = stats_engine.get_stats_snapshot()
+                    self._send(ws_manager, job_id, loop, {
+                        "type": "stats_update",
+                        "data": {
+                            "players": snapshot,
+                            "events": new_events[-20:],
+                        },
+                    })
+                    self._send(ws_manager, job_id, loop, {
+                        "type": "progress",
+                        "data": {
+                            "stage": "Processing frames…",
+                            "percentage": pct,
+                            "frame": frame_idx,
+                            "total_frames": total_frames,
+                            "processed": processed,
+                            "total_samples": sampled_frames,
+                        },
+                    })
 
-                    new_events = stats_engine.get_events()
-                    if processed - last_ws_update >= 30 or len(new_events) > 0:
-                        last_ws_update = processed
-                        snapshot = stats_engine.get_stats_snapshot()
-                        self._send(ws_manager, job_id, loop, {
-                            "type": "stats_update",
-                            "data": {
-                                "players": snapshot,
-                                "events": new_events[-20:],
-                            },
-                        })
-                        self._send(ws_manager, job_id, loop, {
-                            "type": "progress",
-                            "data": {
-                                "stage": "Processing frames…",
-                                "percentage": pct,
-                                "frame": frame_idx,
-                                "total_frames": total_frames,
-                                "processed": processed,
-                                "total_samples": sampled_frames,
-                            },
-                        })
-
-                frame_idx += 1
+            reader.join()
 
             cap.release()
 
