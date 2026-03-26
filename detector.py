@@ -22,7 +22,8 @@ def _get_yolo(model_path: str = "yolov8n.pt"):
     return _yolo
 
 
-_BALL_CLASS = 32  # COCO sports ball
+_BALL_CLASS = 0   # custom model: basketball
+_HOOP_CLASS = 1   # custom model: basketball-hoop
 
 
 class DetectionResult:
@@ -45,7 +46,7 @@ class DetectionResult:
 class Detector:
     RIM_DETECT_INTERVAL = 30
 
-    def __init__(self, model_path: str = "yolov8n.pt", conf: float = 0.15):
+    def __init__(self, model_path: str = "/workspace/models/basketball_detector/weights/best.pt", conf: float = 0.15):
         self.conf = conf
         self.model_path = model_path
         self._model = None
@@ -64,26 +65,36 @@ class Detector:
         h, w = frame.shape[:2]
         result = DetectionResult()
 
-        # Ball detection — class 32 only, cheap
+        # Ball + hoop detection — single forward pass, custom trained model
         preds = self._model.predict(
             source=frame,
-            classes=[_BALL_CLASS],
+            classes=[_BALL_CLASS, _HOOP_CLASS],
             conf=self.conf,
             verbose=False,
-            half=False,  # FP32 for ball — small model, accuracy matters
+            half=False,
         )
 
         if preds and preds[0].boxes is not None:
             boxes = preds[0].boxes
-            best_conf = -1.0
+            best_ball_conf = -1.0
+            best_hoop_conf = -1.0
             for i in range(len(boxes)):
+                cls = int(boxes.cls[i].item())
                 conf = float(boxes.conf[i].item())
-                if conf > best_conf:
-                    best_conf = conf
-                    x1, y1, x2, y2 = [v.item() for v in boxes.xyxy[i]]
+                x1, y1, x2, y2 = [v.item() for v in boxes.xyxy[i]]
+                if cls == _BALL_CLASS and conf > best_ball_conf:
+                    best_ball_conf = conf
                     cx = ((x1 / w) + (x2 / w)) / 2
                     cy = ((y1 / h) + (y2 / h)) / 2
                     result.ball = (cx, cy)
+                elif cls == _HOOP_CLASS and conf > best_hoop_conf:
+                    best_hoop_conf = conf
+                    # store hoop as normalized (cx, cy, w_frac, h_frac)
+                    bw = (x2 - x1) / w
+                    bh = (y2 - y1) / h
+                    self._cached_rim = (((x1 / w) + (x2 / w)) / 2,
+                                        ((y1 / h) + (y2 / h)) / 2,
+                                        bw, bh)
 
         # Rim detection (cached)
         self._rim_call_count += 1
